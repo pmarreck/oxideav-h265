@@ -543,6 +543,9 @@ pub fn interp_chroma_block(
 struct InterpScratch {
     window: Vec<u16>,
     rows: Vec<i32>,
+    /// The horizontal-pass rows at sixteen bits, for bit depths up to
+    /// [`SIXTEEN_BIT_DEPTH`].
+    rows16: Vec<i16>,
 }
 
 thread_local! {
@@ -640,7 +643,12 @@ fn interp_block<const TAPS: usize>(
     let y0 = y_int - half as i32;
     INTERP_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
-        let InterpScratch { window, rows } = &mut *scratch;
+        let InterpScratch {
+            window,
+            rows,
+            rows16,
+        } = &mut *scratch;
+        let narrow = bit_depth <= SIXTEEN_BIT_DEPTH;
         let inside = x0 >= 0
             && y0 >= 0
             && x0 as usize + ww <= plane.width
@@ -682,7 +690,11 @@ fn interp_block<const TAPS: usize>(
             (false, true) => {
                 for (y, o) in out.chunks_exact_mut(w).enumerate() {
                     let s = base + (y + half) * stride;
-                    hpass::<TAPS>(&src[s..s + ww], hk, shift1, o);
+                    if narrow {
+                        hpass16::<TAPS>(&src[s..s + ww], hk, shift1, o);
+                    } else {
+                        hpass::<TAPS>(&src[s..s + ww], hk, shift1, o);
+                    }
                 }
             }
             (true, false) => {
@@ -691,7 +703,24 @@ fn interp_block<const TAPS: usize>(
                         let s = base + (y + t) * stride + half;
                         &src[s..s + w]
                     });
-                    vpass::<TAPS, u16>(rows, vk, shift1, o);
+                    if narrow {
+                        vpass16::<TAPS, u16>(rows, vk, shift1, o);
+                    } else {
+                        vpass::<TAPS, u16>(rows, vk, shift1, o);
+                    }
+                }
+            }
+            (false, false) if narrow => {
+                rows16.clear();
+                rows16.resize(w * wh, 0);
+                for (j, r) in rows16.chunks_exact_mut(w).enumerate() {
+                    let s = base + j * stride;
+                    hpass16_narrow::<TAPS>(&src[s..s + ww], hk, shift1, r);
+                }
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    let r: [&[i16]; TAPS] =
+                        core::array::from_fn(|t| &rows16[(y + t) * w..(y + t + 1) * w]);
+                    vpass16::<TAPS, i16>(r, vk, 6, o);
                 }
             }
             (false, false) => {
@@ -745,6 +774,185 @@ fn vpass<const TAPS: usize, T: Copy + Into<i32>>(
             acc += k[t] * rows[t][x].into();
         }
         *d = acc >> shift;
+    }
+}
+
+/// Bit depths up to which the sixteen-bit filters below give exactly what
+/// [`hpass`] and [`vpass`] give: the samples fit `i16`, and so do the
+/// horizontal pass's results, which the standard sizes to sixteen bits
+/// (`shift1 = BitDepth − 8` keeps an 8-tap sum within −6,144 to 22,528 at
+/// these depths; 14-bit samples would need `shift1 = 6`).
+const SIXTEEN_BIT_DEPTH: u8 = 12;
+
+/// [`hpass`] for bit depths up to [`SIXTEEN_BIT_DEPTH`]: eight results at a
+/// time from SSE2's sixteen-bit multiply-add (`pmaddwd`) on x86-64, the
+/// rest as `hpass` computes them.
+#[inline(always)]
+fn hpass16<const TAPS: usize>(src: &[u16], k: &[i32; TAPS], shift1: i32, out: &mut [i32]) {
+    let w = out.len();
+    assert!(src.len() >= w + TAPS - 1);
+    #[allow(unused_mut)]
+    let mut x = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let coef = madd::pairs(k);
+        while x + 8 <= w {
+            // SAFETY: tap `t` reads `src[x + t .. x + t + 8]`, within the
+            // `w + TAPS − 1` samples asserted above since `x + 8 <= w`, and
+            // the store writes `out[x .. x + 8]`.
+            unsafe {
+                let (lo, hi) = madd::sums8::<TAPS>(|t| src.as_ptr().add(x + t), &coef);
+                madd::store_i32(out.as_mut_ptr().add(x), lo, hi, shift1);
+            }
+            x += 8;
+        }
+    }
+    hpass::<TAPS>(&src[x..], k, shift1, &mut out[x..]);
+}
+
+/// [`hpass16`] writing sixteen-bit results: the rows of a two-dimensional
+/// phase, which fit `i16` at these depths (see [`SIXTEEN_BIT_DEPTH`]).
+#[inline(always)]
+fn hpass16_narrow<const TAPS: usize>(src: &[u16], k: &[i32; TAPS], shift1: i32, out: &mut [i16]) {
+    let w = out.len();
+    assert!(src.len() >= w + TAPS - 1);
+    #[allow(unused_mut)]
+    let mut x = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let coef = madd::pairs(k);
+        while x + 8 <= w {
+            // SAFETY: as in `hpass16`; the store writes `out[x .. x + 8]`.
+            unsafe {
+                let (lo, hi) = madd::sums8::<TAPS>(|t| src.as_ptr().add(x + t), &coef);
+                madd::store_i16(out.as_mut_ptr().add(x), lo, hi, shift1);
+            }
+            x += 8;
+        }
+    }
+    for (i, d) in out.iter_mut().enumerate().skip(x) {
+        let mut acc = 0i32;
+        for t in 0..TAPS {
+            acc += k[t] * i32::from(src[i + t]);
+        }
+        *d = (acc >> shift1) as i16;
+    }
+}
+
+/// [`vpass`] over sixteen-bit rows (samples, or [`hpass16_narrow`]'s
+/// results) for bit depths up to [`SIXTEEN_BIT_DEPTH`], eight results at a
+/// time as [`hpass16`] does them.
+#[inline(always)]
+fn vpass16<const TAPS: usize, T: Copy + Into<i32>>(
+    rows: [&[T]; TAPS],
+    k: &[i32; TAPS],
+    shift: i32,
+    out: &mut [i32],
+) {
+    const { assert!(core::mem::size_of::<T>() == 2) };
+    let w = out.len();
+    let rows: [&[T]; TAPS] = core::array::from_fn(|t| &rows[t][..w]);
+    #[allow(unused_mut)]
+    let mut x = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let coef = madd::pairs(k);
+        while x + 8 <= w {
+            // SAFETY: every row holds `w` sixteen-bit values (sliced above)
+            // and `x + 8 <= w`; the store writes `out[x .. x + 8]`.
+            unsafe {
+                let (lo, hi) =
+                    madd::sums8::<TAPS>(|t| rows[t].as_ptr().add(x).cast::<u16>(), &coef);
+                madd::store_i32(out.as_mut_ptr().add(x), lo, hi, shift);
+            }
+            x += 8;
+        }
+    }
+    let rest: [&[T]; TAPS] = core::array::from_fn(|t| &rows[t][x..]);
+    vpass::<TAPS, T>(rest, k, shift, &mut out[x..]);
+}
+
+/// SSE2's sixteen-bit multiply-add (`pmaddwd`) for the filters above: two
+/// taps' samples interleaved, so each 32-bit lane takes `k[2p]·a + k[2p+1]·b`.
+#[cfg(target_arch = "x86_64")]
+mod madd {
+    use core::arch::x86_64::{
+        __m128i, _mm_add_epi32, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_madd_epi16,
+        _mm_packs_epi32, _mm_set1_epi32, _mm_setzero_si128, _mm_sra_epi32, _mm_storeu_si128,
+        _mm_unpackhi_epi16, _mm_unpacklo_epi16,
+    };
+
+    /// Entry `p`: the coefficient pair `( k[2p], k[2p+1] )` in every 32-bit
+    /// lane, as two sixteen-bit halves, low then high.
+    #[inline(always)]
+    pub(super) fn pairs<const TAPS: usize>(k: &[i32; TAPS]) -> [__m128i; 4] {
+        core::array::from_fn(|p| {
+            if 2 * p + 1 >= TAPS {
+                // SAFETY: SSE2 is part of every x86-64 target.
+                return unsafe { _mm_setzero_si128() };
+            }
+            let (lo, hi) = (k[2 * p] as i16 as u16, k[2 * p + 1] as i16 as u16);
+            // SAFETY: SSE2 is part of every x86-64 target.
+            unsafe { _mm_set1_epi32(((u32::from(hi) << 16) | u32::from(lo)) as i32) }
+        })
+    }
+
+    /// `Σ k[t] · tap(t)[i]` for `i` in `0..8`, as two vectors of four sums.
+    ///
+    /// # Safety
+    ///
+    /// `tap(t)` must point at eight readable sixteen-bit values for every
+    /// `t < TAPS`.
+    #[inline(always)]
+    pub(super) unsafe fn sums8<const TAPS: usize>(
+        tap: impl Fn(usize) -> *const u16,
+        coef: &[__m128i; 4],
+    ) -> (__m128i, __m128i) {
+        // SAFETY: SSE2 is part of every x86-64 target, and the caller
+        // guarantees eight readable values at each tap.
+        unsafe {
+            let (mut lo, mut hi) = (_mm_setzero_si128(), _mm_setzero_si128());
+            for (p, &c) in coef.iter().enumerate().take(TAPS / 2) {
+                let a = _mm_loadu_si128(tap(2 * p).cast::<__m128i>());
+                let b = _mm_loadu_si128(tap(2 * p + 1).cast::<__m128i>());
+                lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), c));
+                hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), c));
+            }
+            (lo, hi)
+        }
+    }
+
+    /// Stores `lo >> shift` then `hi >> shift` as eight `i32`.
+    ///
+    /// # Safety
+    ///
+    /// `out` must have room for eight `i32`.
+    #[inline(always)]
+    pub(super) unsafe fn store_i32(out: *mut i32, lo: __m128i, hi: __m128i, shift: i32) {
+        // SAFETY: SSE2 is part of every x86-64 target, and the caller
+        // guarantees eight `i32` of room.
+        unsafe {
+            let shift = _mm_cvtsi32_si128(shift);
+            _mm_storeu_si128(out.cast::<__m128i>(), _mm_sra_epi32(lo, shift));
+            _mm_storeu_si128(out.add(4).cast::<__m128i>(), _mm_sra_epi32(hi, shift));
+        }
+    }
+
+    /// Stores `lo >> shift` then `hi >> shift` as eight `i16` (the values
+    /// fit, so the saturating pack changes none).
+    ///
+    /// # Safety
+    ///
+    /// `out` must have room for eight `i16`.
+    #[inline(always)]
+    pub(super) unsafe fn store_i16(out: *mut i16, lo: __m128i, hi: __m128i, shift: i32) {
+        // SAFETY: SSE2 is part of every x86-64 target, and the caller
+        // guarantees eight `i16` of room.
+        unsafe {
+            let shift = _mm_cvtsi32_si128(shift);
+            let packed = _mm_packs_epi32(_mm_sra_epi32(lo, shift), _mm_sra_epi32(hi, shift));
+            _mm_storeu_si128(out.cast::<__m128i>(), packed);
+        }
     }
 }
 
@@ -1254,6 +1462,99 @@ fn combine_chroma<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small seeded generator (xorshift64*), so the test needs no crate and
+    /// every failure reproduces from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+    }
+
+    /// Rows of `n` samples at `bit_depth`: random, all at the maximum, and
+    /// alternating maximum and zero both ways, which drive the 8-tap sums to
+    /// their extremes.
+    fn sample_rows(rng: &mut Rng, n: usize, bit_depth: u8) -> Vec<Vec<u16>> {
+        let max = (1u16 << bit_depth) - 1;
+        vec![
+            (0..n).map(|_| (rng.next() as u16) & max).collect(),
+            vec![max; n],
+            (0..n).map(|i| if i % 2 == 0 { max } else { 0 }).collect(),
+            (0..n).map(|i| if i % 2 == 1 { max } else { 0 }).collect(),
+        ]
+    }
+
+    /// The sixteen-bit filters give exactly what `hpass` and `vpass` give, for
+    /// every luma and chroma phase at bit depths 8, 10 and 12 and every width
+    /// from 1 to 72 (the eight-wide body and every tail): random rows and the
+    /// rows that drive the sums to their extremes, through the horizontal pass
+    /// to `i32` and to `i16` (whose results must fit, as the standard sizes
+    /// them), and the vertical pass over samples and over those `i16` results.
+    #[test]
+    fn sixteen_bit_filters_match_the_scalar_filters() {
+        fn check<const TAPS: usize>(rng: &mut Rng, kernels: &[[i32; TAPS]], bit_depth: u8) {
+            let shift1 = interp_shift1(bit_depth);
+            for k in kernels {
+                for w in 1..=72usize {
+                    for src in sample_rows(rng, w + TAPS - 1, bit_depth) {
+                        let (mut want, mut got) = (vec![0; w], vec![0; w]);
+                        hpass::<TAPS>(&src, k, shift1, &mut want);
+                        hpass16::<TAPS>(&src, k, shift1, &mut got);
+                        assert_eq!(
+                            got, want,
+                            "hpass16 {TAPS} taps, depth {bit_depth}, width {w}"
+                        );
+                        let mut narrow = vec![0i16; w];
+                        hpass16_narrow::<TAPS>(&src, k, shift1, &mut narrow);
+                        assert!(
+                            want.iter().all(|&v| i32::from(v as i16) == v),
+                            "horizontal results fit i16 at depth {bit_depth}"
+                        );
+                        let want16: Vec<i16> = want.iter().map(|&v| v as i16).collect();
+                        assert_eq!(
+                            narrow, want16,
+                            "hpass16_narrow {TAPS} taps, depth {bit_depth}, width {w}"
+                        );
+                    }
+                    let rows: Vec<Vec<u16>> = (0..TAPS)
+                        .map(|t| sample_rows(rng, w, bit_depth).swap_remove(t % 4))
+                        .collect();
+                    let rows: [&[u16]; TAPS] = core::array::from_fn(|t| &rows[t][..]);
+                    let (mut want, mut got) = (vec![0; w], vec![0; w]);
+                    vpass::<TAPS, u16>(rows, k, shift1, &mut want);
+                    vpass16::<TAPS, u16>(rows, k, shift1, &mut got);
+                    assert_eq!(
+                        got, want,
+                        "vpass16 over samples, {TAPS} taps, depth {bit_depth}, width {w}"
+                    );
+                    let mids: Vec<Vec<i16>> = (0..TAPS)
+                        .map(|_| {
+                            (0..w)
+                                .map(|_| (rng.next() as i16).clamp(-6144, 22528))
+                                .collect()
+                        })
+                        .collect();
+                    let mids: [&[i16]; TAPS] = core::array::from_fn(|t| &mids[t][..]);
+                    vpass::<TAPS, i16>(mids, k, 6, &mut want);
+                    vpass16::<TAPS, i16>(mids, k, 6, &mut got);
+                    assert_eq!(
+                        got, want,
+                        "vpass16 over rows, {TAPS} taps, depth {bit_depth}, width {w}"
+                    );
+                }
+            }
+        }
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for bit_depth in [8, 10, 12] {
+            check::<8>(&mut rng, &LUMA_FILTER, bit_depth);
+            check::<4>(&mut rng, &CHROMA_FILTER, bit_depth);
+        }
+    }
 
     /// A flat plane interpolates to the constant sample value scaled to
     /// the internal precision: every tap kernel sums to 64, so
