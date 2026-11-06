@@ -832,12 +832,34 @@ pub struct ResidualView<'a> {
 }
 
 /// The §8.5.3.3.4 combine of one component.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Combine {
     /// §8.5.3.3.4.2 default weighting.
     Default,
     /// §8.5.3.3.4.3 explicit `(log2WeightDenom, w0, o0, w1, o1)`.
     Explicit(u8, i32, i32, i32, i32),
+}
+
+impl Combine {
+    /// The default weighting when the explicit weights of every list in use
+    /// (`flags`) are the identity, `w = 1 << log2WeightDenom` and `o = 0`
+    /// (what §7.4.7.3 infers for a reference the stream sends no weights
+    /// for); otherwise `self`. The two give the same samples: with
+    /// `log2WD = log2WeightDenom + shift1`, eqs 8-265..8-277 reduce to eqs
+    /// 8-262..8-264, because `shift2 = shift1 + 1` at every bit depth.
+    /// Encoders commonly enable weighted prediction for a whole stream and
+    /// send weights only for fades, so most blocks take the cheaper form.
+    fn simplified(self, (l0, l1): (bool, bool)) -> Self {
+        let Combine::Explicit(denom, w0, o0, w1, o1) = self else {
+            return self;
+        };
+        let identity = |w: i32, o: i32| w == 1 << denom && o == 0;
+        if (!l0 || identity(w0, o0)) && (!l1 || identity(w1, o1)) {
+            Combine::Default
+        } else {
+            self
+        }
+    }
 }
 
 thread_local! {
@@ -1039,6 +1061,7 @@ fn write_mc_block(
         }
     }
     let rect = (x0 - ox, y0 - oy, w, h);
+    let combine = combine.simplified(flags);
     let (p0, p1) = match flags {
         (true, true) => (p0, p1),
         (true, false) => (p0, &[][..]),
@@ -4439,5 +4462,141 @@ mod tests {
             res.cr.as_ref().unwrap().samples.iter().all(|&v| v == 4),
             "cr"
         );
+    }
+
+    /// Explicit weights that are the identity for every list in use are the
+    /// default weighting; any other weight or offset in use keeps them.
+    #[test]
+    fn identity_weights_combine_by_default() {
+        let all = [(true, true), (true, false), (false, true)];
+        for denom in 0..=7u8 {
+            let one = 1i32 << denom;
+            for flags in all {
+                assert_eq!(
+                    Combine::Explicit(denom, one, 0, one, 0).simplified(flags),
+                    Combine::Default
+                );
+            }
+            for (w0, o0, w1, o1) in [
+                (one + 1, 0, one, 0),
+                (one, -1, one, 0),
+                (one, 0, one - 1, 0),
+                (one, 0, one, 1),
+            ] {
+                let explicit = Combine::Explicit(denom, w0, o0, w1, o1);
+                let l0_used = (w0, o0) != (one, 0);
+                let kept = if l0_used {
+                    [(true, true), (true, false)]
+                } else {
+                    [(true, true), (false, true)]
+                };
+                let unused = if l0_used {
+                    (false, true)
+                } else {
+                    (true, false)
+                };
+                for flags in kept {
+                    assert_eq!(
+                        explicit.simplified(flags),
+                        explicit,
+                        "{denom} {flags:?} {explicit:?}"
+                    );
+                }
+                assert_eq!(
+                    explicit.simplified(unused),
+                    Combine::Default,
+                    "{denom} {unused:?} {explicit:?}"
+                );
+            }
+        }
+        assert_eq!(Combine::Default.simplified((true, true)), Combine::Default);
+    }
+
+    /// Weighted prediction writes the samples of §8.5.3.3.4.3 (eqs
+    /// 8-265..8-277, in 64-bit arithmetic as the standard states them), with
+    /// identity weights or any others, for each bit depth, list use and
+    /// residual.
+    #[test]
+    fn weighted_prediction_writes_the_standards_samples() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let (w, h) = (8usize, 4usize);
+        for bit_depth in 8..=16u8 {
+            let max = (1i64 << bit_depth) - 1;
+            let shift1 = core::cmp::max(2, 14 - i64::from(bit_depth));
+            for denom in 0..=7u8 {
+                let one = 1i32 << denom;
+                let offset = |r: u64| (r % 256) as i32 - 128;
+                let weight = |r: u64| (r % 256) as i32 - 128 + one;
+                let r = [next(), next(), next(), next()];
+                let sets = [
+                    (one, 0, one, 0),
+                    (one, 0, weight(r[2]), offset(r[3])),
+                    (weight(r[0]), offset(r[1]), weight(r[2]), offset(r[3])),
+                ];
+                for (w0, o0, w1, o1) in sets {
+                    for flags in [(true, true), (true, false), (false, true)] {
+                        for with_residual in [false, true] {
+                            // Intermediate samples span the range the
+                            // interpolation produces, past both ends.
+                            let span = 1i64 << 16;
+                            let mut sample = || (next() % span as u64) as i32 - (1 << 14);
+                            let p0: Vec<i32> = (0..w * h).map(|_| sample()).collect();
+                            let p1: Vec<i32> = (0..w * h).map(|_| sample()).collect();
+                            let res: Vec<i32> =
+                                (0..w * h).map(|_| (next() % 512) as i32 - 256).collect();
+                            let mut pic = Picture::new(16, 8, 1, bit_depth, bit_depth);
+                            write_mc_block(
+                                &mut pic,
+                                Plane::Luma,
+                                (4, 2, w, h),
+                                flags,
+                                (&p0, &p1),
+                                Combine::Explicit(denom, w0, o0, w1, o1),
+                                with_residual.then_some(ResidualView {
+                                    samples: &res,
+                                    stride: w,
+                                }),
+                                bit_depth,
+                            );
+                            let log2_wd = i64::from(denom) + shift1;
+                            let (w0, o0, w1, o1) =
+                                (i64::from(w0), i64::from(o0), i64::from(w1), i64::from(o1));
+                            let plane = pic.plane(Plane::Luma);
+                            for i in 0..w * h {
+                                let (a, b) = (i64::from(p0[i]), i64::from(p1[i]));
+                                let predicted = match flags {
+                                    (true, true) => {
+                                        (a * w0 + b * w1 + ((o0 + o1 + 1) << log2_wd))
+                                            >> (log2_wd + 1)
+                                    }
+                                    (true, false) => {
+                                        ((a * w0 + (1 << (log2_wd - 1))) >> log2_wd) + o0
+                                    }
+                                    _ => ((b * w1 + (1 << (log2_wd - 1))) >> log2_wd) + o1,
+                                }
+                                .clamp(0, max);
+                                let want = if with_residual {
+                                    (predicted + i64::from(res[i])).clamp(0, max)
+                                } else {
+                                    predicted
+                                };
+                                let (x, y) = (4 + i % w, 2 + i / w);
+                                assert_eq!(
+                                    i64::from(plane[y * 16 + x]),
+                                    want,
+                                    "depth {bit_depth}, denom {denom}, {flags:?}, weights {w0} {o0} {w1} {o1}, residual {with_residual}, sample {i}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
