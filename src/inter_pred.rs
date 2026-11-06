@@ -1529,8 +1529,15 @@ mod tests {
     fn sixteen_bit_filters_match_the_scalar_filters() {
         fn check<const TAPS: usize>(rng: &mut Rng, kernels: &[[i32; TAPS]], bit_depth: u8) {
             let shift1 = interp_shift1(bit_depth);
+            // Under Miri, which interprets every access, the widths around
+            // each vector step still take every vector and scalar path.
+            let widths: Vec<usize> = if cfg!(miri) {
+                vec![1, 7, 8, 9, 15, 16, 17, 24]
+            } else {
+                (1..=72).collect()
+            };
             for k in kernels {
-                for w in 1..=72usize {
+                for w in widths.iter().copied() {
                     for src in sample_rows(rng, w + TAPS - 1, bit_depth) {
                         let (mut want, mut got) = (vec![0; w], vec![0; w]);
                         hpass::<TAPS>(&src, k, shift1, &mut want);
@@ -1655,7 +1662,7 @@ mod tests {
             let max = (1u32 << bit_depth) - 1;
             let samples: Vec<u16> = (0..pw * ph).map(|_| (rnd() & max) as u16).collect();
             let plane = RefPlane::new(&samples, pw, ph).unwrap();
-            for _ in 0..400 {
+            for _ in 0..if cfg!(miri) { 40 } else { 400 } {
                 let (w, h) = (1 + (rnd() % 16) as usize, 1 + (rnd() % 16) as usize);
                 let x = (rnd() % 70) as i32 - 20;
                 let y = (rnd() % 60) as i32 - 20;
