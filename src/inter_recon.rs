@@ -1790,35 +1790,11 @@ fn reconstruct_inter_leaf_cu(
     }
 
     // §6.4.2 prediction-block availability against the shared tiling + the
-    // per-cell intra / inter flag of the motion field. The candidate
-    // derivation also *mutates* `field` (writing each PU's resolved motion),
-    // so the closure cannot borrow `field` directly; snapshot the per-4×4
-    // intra-flag grid up front. A neighbour outside the current CU was
-    // decoded before it, so its intra flag is already final; positions
-    // inside the current CU are excluded by the §6.4.2 z-scan test.
-    //
-    // Only the cells bordering the CU are ever asked about: every PU lies
-    // inside the CU, and the §8.5.3.2.3 / §8.5.3.2.7 spatial neighbours
-    // A0 / A1 / B0 / B1 / B2 of a PU at (xPb, yPb) of size nPbW × nPbH sit
-    // at xPb − 1 ..= xPb + nPbW and yPb − 1 ..= yPb + nPbH. So the snapshot
-    // covers the CU plus a one-cell border, not the whole picture.
+    // per-cell intra / inter flag of the motion field, read from a snapshot
+    // of the CU's border (`IntraBorder`).
     let x_cb = cu.x0;
     let y_cb = cu.y0;
-    let w4 = field.width_4();
-    let h4 = field.height_4();
-    let gx0 = (x_cb as usize / 4).saturating_sub(1);
-    let gy0 = (y_cb as usize / 4).saturating_sub(1);
-    let gx1 = ((x_cb as usize + n_cb_s) / 4 + 1).min(w4);
-    let gy1 = ((y_cb as usize + n_cb_s) / 4 + 1).min(h4);
-    let win_w = gx1.saturating_sub(gx0);
-    let mut intra_grid = vec![false; win_w * gy1.saturating_sub(gy0)];
-    if win_w > 0 {
-        for (row, gy) in intra_grid.chunks_mut(win_w).zip(gy0..gy1) {
-            for (cell, gx) in row.iter_mut().zip(gx0..gx1) {
-                *cell = field.cell_at(gx * 4, gy * 4).is_intra;
-            }
-        }
-    }
+    let border = IntraBorder::new(field, x_cb as usize, y_cb as usize, n_cb_s);
     let tiling = ctx.tiling();
     let available = |x_nb: i32, y_nb: i32| -> bool {
         let cu_pred_mode = |x: u32, y: u32| -> u8 {
@@ -1838,13 +1814,10 @@ fn reconstruct_inter_leaf_cu(
             }
             let (gx, gy) = ((x as usize) / 4, (y as usize) / 4);
             debug_assert!(
-                gx >= gx0 && gy >= gy0 && (gx < gx1 || gx >= w4) && (gy < gy1 || gy >= h4),
+                border.covers(gx, gy),
                 "CuPredMode query ({x}, {y}) outside the CU's border"
             );
-            if (gx0..gx1).contains(&gx)
-                && (gy0..gy1).contains(&gy)
-                && intra_grid[(gy - gy0) * win_w + (gx - gx0)]
-            {
+            if border.is_intra(gx, gy) {
                 crate::availability::MODE_INTRA
             } else {
                 0
@@ -1950,6 +1923,83 @@ pub fn decode_inter_picture(
     let output = picture.clone();
     seq.store_picture(poc, layer_id, picture, motion);
     Ok(output)
+}
+
+/// The intra flags of the 4×4 cells bordering a coding unit, taken before
+/// its motion is resolved: the candidate derivation writes the motion field
+/// (each PU's resolved motion) while the §6.4.2 availability reads it. A
+/// neighbour outside the CU was decoded before it, so its flag is final.
+///
+/// Only the cells bordering the CU are ever asked about: every PU lies
+/// inside the CU, and the §8.5.3.2.3 / §8.5.3.2.7 spatial neighbours
+/// A0 / A1 / B0 / B1 / B2 of a PU at (xPb, yPb) of size nPbW × nPbH sit at
+/// xPb − 1 ..= xPb + nPbW and yPb − 1 ..= yPb + nPbH. A position inside the
+/// CU answers MODE_INTER before the border is consulted, so the CU's own
+/// cells are not taken.
+struct IntraBorder {
+    /// The window of cells, the CU plus a one-cell border clipped to the
+    /// field: columns `gx0..gx1`, rows `gy0..gy1`.
+    gx0: usize,
+    gy0: usize,
+    gx1: usize,
+    gy1: usize,
+    /// The field's width and height in cells.
+    w4: usize,
+    h4: usize,
+    /// The window's flags row by row, `false` for the CU's own cells.
+    cells: Vec<bool>,
+}
+
+impl IntraBorder {
+    /// The border of the `n_cb_s`-sample CU at luma `(x_cb, y_cb)`.
+    fn new(field: &crate::motion::MotionField, x_cb: usize, y_cb: usize, n_cb_s: usize) -> Self {
+        let (w4, h4) = (field.width_4(), field.height_4());
+        let gx0 = (x_cb / 4).saturating_sub(1);
+        let gy0 = (y_cb / 4).saturating_sub(1);
+        let gx1 = ((x_cb + n_cb_s) / 4 + 1).min(w4);
+        let gy1 = ((y_cb + n_cb_s) / 4 + 1).min(h4);
+        let width = gx1.saturating_sub(gx0);
+        let mut cells = vec![false; width * gy1.saturating_sub(gy0)];
+        if width > 0 {
+            let (cx0, cx1) = (x_cb / 4, (x_cb + n_cb_s) / 4);
+            let (cy0, cy1) = (y_cb / 4, (y_cb + n_cb_s) / 4);
+            for (row, gy) in cells.chunks_mut(width).zip(gy0..gy1) {
+                let inside = if (cy0..cy1).contains(&gy) {
+                    cx0.max(gx0)..cx1.min(gx1)
+                } else {
+                    gx0..gx0
+                };
+                for gx in (gx0..inside.start).chain(inside.end..gx1) {
+                    row[gx - gx0] = field.is_intra_at(gx * 4, gy * 4);
+                }
+            }
+        }
+        Self {
+            gx0,
+            gy0,
+            gx1,
+            gy1,
+            w4,
+            h4,
+            cells,
+        }
+    }
+
+    /// Whether cell `(gx, gy)` lies where the availability may ask: in the
+    /// window, or past the field's right or bottom edge.
+    fn covers(&self, gx: usize, gy: usize) -> bool {
+        gx >= self.gx0
+            && gy >= self.gy0
+            && (gx < self.gx1 || gx >= self.w4)
+            && (gy < self.gy1 || gy >= self.h4)
+    }
+
+    /// Whether border cell `(gx, gy)` is intra; `false` outside the window.
+    fn is_intra(&self, gx: usize, gy: usize) -> bool {
+        (self.gx0..self.gx1).contains(&gx)
+            && (self.gy0..self.gy1).contains(&gy)
+            && self.cells[(gy - self.gy0) * (self.gx1 - self.gx0) + (gx - self.gx0)]
+    }
 }
 
 #[cfg(test)]
@@ -2830,5 +2880,69 @@ mod tests {
         // The P picture's motion field records the inter CU (for a future
         // picture's temporal MVP).
         assert!(!seq.dpb().entries()[1].motion.cell_at(16, 16).is_intra);
+    }
+
+    /// The border snapshot answers as the motion field does for every cell
+    /// around a CU: in the picture, at its edges and past them.
+    #[test]
+    fn intra_border_answers_as_the_field_for_every_border_cell() {
+        use crate::motion::{MotionCell, MotionField};
+        let (w, h) = (64usize, 48usize);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut field = MotionField::new(w, h);
+        for gy in 0..h / 4 {
+            for gx in 0..w / 4 {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                let intra = seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 63 == 1;
+                let cell = MotionCell {
+                    is_intra: intra,
+                    pred_flag_l0: !intra,
+                    ..MotionCell::default()
+                };
+                field.fill_rect(gx * 4, gy * 4, 4, 4, cell);
+            }
+        }
+        let (mut intra, mut inter) = (0, 0);
+        for (x_cb, y_cb, n) in [
+            (0, 0, 16),
+            (16, 16, 16),
+            (48, 32, 16),
+            (8, 8, 8),
+            (0, 24, 8),
+            (56, 40, 8),
+            (16, 0, 32),
+            (32, 16, 32),
+        ] {
+            let border = IntraBorder::new(&field, x_cb, y_cb, n);
+            let (cx0, cy0, cx1, cy1) = (x_cb / 4, y_cb / 4, (x_cb + n) / 4, (y_cb + n) / 4);
+            for gy in cy0.saturating_sub(1)..=cy1 {
+                for gx in cx0.saturating_sub(1)..=cx1 {
+                    if (cx0..cx1).contains(&gx) && (cy0..cy1).contains(&gy) {
+                        continue;
+                    }
+                    let want = gx < w / 4 && gy < h / 4 && field.is_intra_at(gx * 4, gy * 4);
+                    if want {
+                        intra += 1;
+                    } else {
+                        inter += 1;
+                    }
+                    assert_eq!(
+                        border.is_intra(gx, gy),
+                        want,
+                        "CU ({x_cb}, {y_cb}) of {n}: cell ({gx}, {gy})"
+                    );
+                    assert!(
+                        border.covers(gx, gy),
+                        "CU ({x_cb}, {y_cb}) of {n}: cell ({gx}, {gy})"
+                    );
+                }
+            }
+        }
+        assert!(
+            intra > 20 && inter > 20,
+            "both kinds of neighbor: {intra} intra, {inter} not"
+        );
     }
 }

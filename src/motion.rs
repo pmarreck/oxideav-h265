@@ -1210,19 +1210,37 @@ impl MotionField {
         if let Some(p) = &self.pending {
             return p.0.cell_at(x, y);
         }
+        match self.stored_index(x, y) {
+            Some(idx) => self.cell_index(idx),
+            None => MotionCell::compose(FLAG_INTRA, NO_MOTION),
+        }
+    }
+
+    /// Whether the cell covering luma sample `(x, y)` is intra: the
+    /// `is_intra` of [`Self::cell_at`], read from the cell's mode bits
+    /// alone.
+    #[must_use]
+    pub fn is_intra_at(&self, x: usize, y: usize) -> bool {
+        if self.pending.is_some() {
+            return self.cell_at(x, y).is_intra;
+        }
+        self.stored_index(x, y)
+            .is_none_or(|idx| self.flags[idx] & FLAG_INTRA != 0)
+    }
+
+    /// The stored index of the cell covering luma sample `(x, y)`, or
+    /// `None` outside the stored cells. A band reports the unwritten
+    /// background (an intra cell with no motion) there: the §6.4.2
+    /// availability denies every such neighbour (a later CTB row) anyway.
+    #[inline]
+    fn stored_index(&self, x: usize, y: usize) -> Option<usize> {
         let bx = x / 4;
         let by = y / 4;
-        // A band reports the unwritten background (an intra cell with
-        // no motion) outside its stored rows — the §6.4.2 availability
-        // denies every such neighbour (a later CTB row) anyway.
-        if by < self.origin_4
-            || by >= self.origin_4 + self.rows_4
-            || bx < self.origin_4x
-            || bx >= self.origin_4x + self.cols_4
-        {
-            return MotionCell::compose(FLAG_INTRA, NO_MOTION);
-        }
-        self.cell_index((by - self.origin_4) * self.cols_4 + (bx - self.origin_4x))
+        (by >= self.origin_4
+            && by < self.origin_4 + self.rows_4
+            && bx >= self.origin_4x
+            && bx < self.origin_4x + self.cols_4)
+            .then(|| (by - self.origin_4) * self.cols_4 + (bx - self.origin_4x))
     }
 
     /// Whether any cell is inter-coded (the field carries motion).
@@ -2191,6 +2209,43 @@ mod tests {
             derive_temporal_mv(&mf, 0, 0, 16, 16, &from_l1),
             Some([10, 2]),
             "collocated_from_l0_flag == 0 ⇒ N = 0 ⇒ the col L0 motion"
+        );
+    }
+
+    /// `is_intra_at` reads the intra flag `cell_at` composes, for intra and
+    /// inter cells and, in a band, the background outside its cells.
+    #[test]
+    fn is_intra_at_reads_the_intra_flag_of_cell_at() {
+        let inter = MotionCell {
+            pred_flag_l0: true,
+            ref_poc_l0: 3,
+            mv_l0: [5, -2],
+            ..MotionCell::default()
+        };
+        let intra = MotionCell {
+            is_intra: true,
+            ..MotionCell::default()
+        };
+        let whole = MotionField::new(64, 32);
+        let band = MotionField::new_rect_band(64, 32, (16, 8, 32, 16));
+        for (name, mut field) in [("whole", whole), ("band", band)] {
+            field.fill_rect(0, 0, 64, 32, inter);
+            field.fill_rect(20, 8, 8, 12, intra);
+            for y in 0..32 {
+                for x in 0..64 {
+                    assert_eq!(
+                        field.is_intra_at(x, y),
+                        field.cell_at(x, y).is_intra,
+                        "{name} ({x}, {y})"
+                    );
+                }
+            }
+            assert!(field.is_intra_at(24, 12), "{name}: intra cell");
+            assert!(!field.is_intra_at(16, 8), "{name}: inter cell");
+        }
+        assert!(
+            MotionField::new_rect_band(64, 32, (16, 8, 32, 16)).is_intra_at(0, 0),
+            "outside a band: the intra background"
         );
     }
 }
