@@ -342,6 +342,7 @@ pub struct EngineResidualBinSource<'e, 'a, 'c> {
 }
 
 impl ResidualBinSource for EngineResidualBinSource<'_, '_, '_> {
+    #[inline]
     fn decision(&mut self, element: ResidualElement, ctx_inc: u32) -> Result<u8, CabacError> {
         let bank: &mut [ContextModel] = match element {
             ResidualElement::LastSigCoeffXPrefix => &mut self.contexts.last_sig_coeff_x_prefix,
@@ -361,18 +362,22 @@ impl ResidualBinSource for EngineResidualBinSource<'_, '_, '_> {
         self.engine.decode_decision(&mut bank[ctx_inc as usize])
     }
 
+    #[inline]
     fn bypass(&mut self) -> Result<u8, CabacError> {
         self.engine.decode_bypass()
     }
 
+    #[inline]
     fn bypass_bits(&mut self, n: u8) -> Result<u32, CabacError> {
         self.engine.decode_bypass_bits(n)
     }
 
+    #[inline]
     fn align_bypass(&mut self) {
         self.engine.align_bypass();
     }
 
+    #[inline]
     fn stat_coeff(&mut self) -> &mut [u8; 4] {
         &mut self.contexts.stat_coeff
     }
