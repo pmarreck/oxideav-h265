@@ -612,6 +612,32 @@ pub fn interp_chroma_into(
     );
 }
 
+/// Asks for the `rows` rows of `cols` samples from `base` (row pitch
+/// `stride`) to be loaded into the cache. A large picture's rows are far
+/// apart (a 2160p 10-bit row is 7,680 bytes), so each row's first read
+/// misses the cache; asking for all of a block's rows first lets those
+/// misses overlap instead of following one another.
+#[inline(always)]
+fn prefetch_rows(src: &[u16], base: usize, stride: usize, cols: usize, rows: usize) {
+    #[cfg(target_arch = "x86_64")]
+    for row in (0..rows).map(|j| base + j * stride) {
+        // One request per 64-byte line: every 32 samples, and the last.
+        for at in (row..row + cols).step_by(32).chain([row + cols - 1]) {
+            if let Some(sample) = src.get(at) {
+                // SAFETY: SSE is part of every x86-64 target, and a prefetch
+                // only hints the cache.
+                unsafe {
+                    core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                        core::ptr::from_ref(sample).cast::<i8>(),
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (src, base, stride, cols, rows);
+}
+
 /// The separable `TAPS`-tap interpolation of one block. The source
 /// window `( x_int − TAPS/2 + 1, y_int − TAPS/2 + 1 )` of `( w + TAPS −
 /// 1 ) × ( h + TAPS − 1 )` samples is read in place when it lies inside
@@ -655,7 +681,11 @@ fn interp_block<const TAPS: usize>(
             && y0 as usize + wh <= plane.height;
         plane.ensure_rows(y0, y0 + wh as i32);
         let (src, stride, base): (&[u16], usize, usize) = match (inside, plane.flat()) {
-            (true, Some(flat)) => (flat, plane.width, y0 as usize * plane.width + x0 as usize),
+            (true, Some(flat)) => {
+                let base = y0 as usize * plane.width + x0 as usize;
+                prefetch_rows(flat, base, plane.width, ww, wh);
+                (flat, plane.width, base)
+            }
             _ => {
                 window.clear();
                 window.reserve(ww * wh);
