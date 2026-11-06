@@ -56,6 +56,18 @@ impl<'a> BitReader<'a> {
         Self { buf, bit_pos: 0 }
     }
 
+    /// A reader over `buf` positioned at bit `bit_pos` (the CABAC
+    /// engine handing its bit source back).
+    pub(crate) fn at(buf: &'a [u8], bit_pos: usize) -> Self {
+        Self { buf, bit_pos }
+    }
+
+    /// The whole buffer and the bit cursor into it (the CABAC engine
+    /// taking the bit source over).
+    pub(crate) fn source(&self) -> (&'a [u8], usize) {
+        (self.buf, self.bit_pos)
+    }
+
     /// Number of bits still available.
     pub fn bits_left(&self) -> usize {
         self.buf

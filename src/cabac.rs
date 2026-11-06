@@ -296,21 +296,46 @@ pub(crate) const TRANS_IDX_MPS: [u8; 64] = [
 /// The §9.3.4.3 arithmetic decoding engine state plus its bit source.
 ///
 /// The engine holds the two §9.3.2.6 registers `ivlCurrRange` and
-/// `ivlOffset` and the [`BitReader`] from which renormalization /
-/// bypass pull `read_bits(1)`. Context variables ([`ContextModel`])
-/// live in the caller's context-model array; each
+/// `ivlOffset` and the slice data from which renormalization / bypass
+/// pull `read_bits(1)`. Context variables ([`ContextModel`]) live in the
+/// caller's context-model array; each
 /// [`decode_decision`](CabacEngine::decode_decision) call takes and
 /// mutates one in place.
 #[derive(Debug)]
 pub struct CabacEngine<'a> {
-    reader: BitReader<'a>,
-    /// §9.3.2.6 `ivlCurrRange` (held in a 16-bit-wide register; values
-    /// stay within 9 bits during decode).
-    ivl_curr_range: u16,
-    /// §9.3.2.6 `ivlOffset` (10-bit register precision is required for
-    /// bypass).
-    ivl_offset: u16,
+    /// §9.3.2.6 `ivlCurrRange`: 9 bits between bins.
+    range: u32,
+    /// §9.3.2.6 `ivlOffset`, held with the next `ahead` bits of the
+    /// stream already loaded below it: `window = ivlOffset * 2^ahead +
+    /// those bits`. Comparing or subtracting `ivlCurrRange * 2^ahead`
+    /// against `window` is comparing or subtracting `ivlCurrRange`
+    /// against `ivlOffset`, and a read of `n` bits into `ivlOffset`
+    /// (§9.3.4.3.3, §9.3.4.3.4) only lowers `ahead` by `n`, so the
+    /// stream is loaded a byte at a time, several bytes at once, rather
+    /// than read bit by bit.
+    window: u64,
+    /// Stream bits in `window` below `ivlOffset`, at most `MAX_AHEAD`.
+    ahead: u32,
+    /// The slice data, from the start of the reader's buffer.
+    data: &'a [u8],
+    /// The next byte of `data` to load into `window`.
+    next_byte: usize,
 }
+
+/// Stream bits loaded ahead of `ivlOffset` at most. `ivlOffset` stays
+/// below `ivlCurrRange` (§9.3.2.6 forbids starting at 510 or 511), so it
+/// needs 10 bits at most (the bypass doubling): `window` stays within
+/// 58 bits.
+const MAX_AHEAD: u32 = 48;
+
+/// The low `bits` bits of a word (`bits` in `0..=63`).
+#[inline(always)]
+const fn low_mask(bits: u32) -> u64 {
+    (1u64 << bits) - 1
+}
+
+/// `TRANS_IDX_MPS` and `TRANS_IDX_LPS` by whether the bin was the LPS.
+static TRANS_IDX: [[u8; 64]; 2] = [TRANS_IDX_MPS, TRANS_IDX_LPS];
 
 impl<'a> CabacEngine<'a> {
     /// §9.3.2.6 — construct and initialize the arithmetic decoding
@@ -318,37 +343,48 @@ impl<'a> CabacEngine<'a> {
     /// first bit of `slice_segment_data()`. Sets `ivlCurrRange = 510`
     /// and `ivlOffset = read_bits(9)`, and validates the §9.3.2.6
     /// constraint that `ivlOffset` is not 510 or 511.
-    pub fn new(mut reader: BitReader<'a>) -> Result<Self, CabacError> {
-        let ivl_offset = reader.u(9)? as u16;
-        if ivl_offset >= 510 {
-            return Err(CabacError::InvalidInitOffset(ivl_offset));
+    pub fn new(reader: BitReader<'a>) -> Result<Self, CabacError> {
+        let (data, bit_pos) = reader.source();
+        let mut engine = Self {
+            range: 510,
+            window: 0,
+            ahead: 0,
+            data,
+            next_byte: bit_pos / 8,
+        };
+        // Starting inside a byte: that byte, without the bits before the
+        // position, is the first loaded.
+        let bit = (bit_pos % 8) as u32;
+        if bit > 0
+            && let Some(&first) = data.get(bit_pos / 8)
+        {
+            engine.window = u64::from(first) & low_mask(8 - bit);
+            engine.ahead = 8 - bit;
+            engine.next_byte += 1;
         }
-        Ok(Self {
-            reader,
-            ivl_curr_range: 510,
-            ivl_offset,
-        })
+        engine.init_engine()?;
+        Ok(engine)
     }
 
     /// §9.3.2.6 — re-initialize the engine registers on an already
     /// constructed engine (e.g. after `pcm_flag == 1` data is consumed,
-    /// per §9.3.2.5 / §9.3.2.6). The bit reader is *not* repositioned;
+    /// per §9.3.2.5 / §9.3.2.6). The bit position is *not* moved first;
     /// the caller is responsible for having advanced it to the byte
     /// boundary following the PCM samples before calling this.
     pub fn init_engine(&mut self) -> Result<(), CabacError> {
-        let ivl_offset = self.reader.u(9)? as u16;
+        let ivl_offset = self.take_raw(9)?;
         if ivl_offset >= 510 {
-            return Err(CabacError::InvalidInitOffset(ivl_offset));
+            return Err(CabacError::InvalidInitOffset(ivl_offset as u16));
         }
-        self.ivl_curr_range = 510;
-        self.ivl_offset = ivl_offset;
+        self.range = 510;
+        self.window = (u64::from(ivl_offset) << self.ahead) | (self.window & low_mask(self.ahead));
         Ok(())
     }
 
     /// Current `ivlCurrRange` register value (for tests / inspection).
     #[must_use]
     pub fn ivl_curr_range(&self) -> u16 {
-        self.ivl_curr_range
+        self.range as u16
     }
 
     /// §9.3.4.3.6 — alignment process prior to aligned bypass
@@ -361,115 +397,161 @@ impl<'a> CabacEngine<'a> {
     /// view); bypass decoding itself never changes `ivlCurrRange`, so
     /// repeated invocations inside one aligned run are no-ops.
     pub fn align_bypass(&mut self) {
-        self.ivl_curr_range = 256;
+        self.range = 256;
     }
 
     /// Current `ivlOffset` register value (for tests / inspection).
     #[must_use]
     pub fn ivl_offset(&self) -> u16 {
-        self.ivl_offset
+        (self.window >> self.ahead) as u16
     }
 
-    /// Bit position of the underlying reader (for tests / locating the
-    /// engine's consumption point in the buffer).
+    /// Bit position in the reader's buffer of the next stream bit not
+    /// yet read into `ivlOffset` (for tests / locating the engine's
+    /// consumption point in the buffer).
     #[must_use]
     pub fn bit_pos(&self) -> usize {
-        self.reader.bit_pos()
+        self.next_byte * 8 - self.ahead as usize
     }
 
     /// §7.3.8.7 support — consume `pcm_alignment_zero_bit` from the
     /// raw bit source until it is byte-aligned. Called right after a
     /// `pcm_flag == 1` terminate bin: §9.3.4.3.5 leaves the bitstream
     /// pointer directly after the terminating one bit, so the raw
-    /// reader position is authoritative for `byte_aligned()`.
+    /// position is authoritative for `byte_aligned()`.
     ///
     /// # Errors
     /// [`CabacError::EndOfBuffer`] on a truncated stream.
     pub fn pcm_align(&mut self) -> Result<(), CabacError> {
-        while !self.reader.bit_pos().is_multiple_of(8) {
-            let _ = self.reader.u1()?;
+        let pad = (8 - self.bit_pos() % 8) % 8;
+        self.take_raw(pad as u32).map(|_| ())
+    }
+
+    /// §7.3.8.7 support — read one raw `u(n)` field (a
+    /// `pcm_sample_luma` / `pcm_sample_chroma` value, `n` in `0..=32`)
+    /// directly from the bit source, bypassing the arithmetic engine.
+    ///
+    /// # Errors
+    /// [`CabacError::EndOfBuffer`] on a truncated stream or `n > 32`.
+    pub fn read_raw_bits(&mut self, n: u8) -> Result<u32, CabacError> {
+        if n > 32 {
+            return Err(CabacError::EndOfBuffer);
+        }
+        self.take_raw(u32::from(n))
+    }
+
+    /// Consume the engine and hand back its bit source, positioned at
+    /// [`Self::bit_pos`] (tests / callers that continue non-CABAC parsing
+    /// after termination).
+    #[must_use]
+    pub fn into_reader(self) -> BitReader<'a> {
+        BitReader::at(self.data, self.bit_pos())
+    }
+
+    /// Loads whole bytes below `ivlOffset` while they fit.
+    #[inline(always)]
+    fn refill(&mut self) {
+        while self.ahead <= MAX_AHEAD - 8 {
+            let Some(&byte) = self.data.get(self.next_byte) else {
+                break;
+            };
+            self.window = (self.window << 8) | u64::from(byte);
+            self.next_byte += 1;
+            self.ahead += 8;
+        }
+    }
+
+    /// Makes `bits` stream bits available below `ivlOffset`, failing
+    /// with `EndOfBuffer` when the stream holds fewer.
+    #[inline(always)]
+    fn ensure(&mut self, bits: u32) -> Result<(), CabacError> {
+        if self.ahead < bits {
+            self.refill();
+            if self.ahead < bits {
+                return Err(CabacError::EndOfBuffer);
+            }
         }
         Ok(())
     }
 
-    /// §7.3.8.7 support — read one raw `u(n)` field (a
-    /// `pcm_sample_luma` / `pcm_sample_chroma` value) directly from the
-    /// bit source, bypassing the arithmetic engine.
-    ///
-    /// # Errors
-    /// [`CabacError::EndOfBuffer`] on a truncated stream.
-    pub fn read_raw_bits(&mut self, n: u8) -> Result<u32, CabacError> {
-        Ok(self.reader.u(n)?)
+    /// `ivlOffset = (ivlOffset << bits) | read_bits(bits)`, the reads of
+    /// §9.3.4.3.3 and §9.3.4.3.4.
+    #[inline(always)]
+    fn read_into_offset(&mut self, bits: u32) -> Result<(), CabacError> {
+        self.ensure(bits)?;
+        self.ahead -= bits;
+        Ok(())
     }
 
-    /// Consume the engine and hand back its bit source (tests / callers
-    /// that continue non-CABAC parsing after termination).
-    #[must_use]
-    pub fn into_reader(self) -> BitReader<'a> {
-        self.reader
+    /// `read_bits(bits)` past the arithmetic engine (`bits` in `0..=32`):
+    /// the next `bits` stream bits, taken out from below `ivlOffset`,
+    /// which keeps its value.
+    fn take_raw(&mut self, bits: u32) -> Result<u32, CabacError> {
+        self.ensure(bits)?;
+        let rest = self.ahead - bits;
+        let value = ((self.window >> rest) & low_mask(bits)) as u32;
+        let offset = self.window >> self.ahead;
+        self.window = (offset << rest) | (self.window & low_mask(rest));
+        self.ahead = rest;
+        Ok(value)
+    }
+
+    /// `ivlCurrRange * 2^ahead`, `ivlCurrRange` on the scale of `window`.
+    #[inline(always)]
+    fn scaled_range(&self) -> u64 {
+        u64::from(self.range) << self.ahead
     }
 
     /// §9.3.4.3.3 — renormalization in the arithmetic decoding engine
     /// (RenormD). While `ivlCurrRange < 256`, double `ivlCurrRange` and
-    /// shift one fresh bit into `ivlOffset`.
+    /// shift one fresh bit into `ivlOffset`: as many doublings as
+    /// `ivlCurrRange` (at least 2 here) has leading zeros past bit 8,
+    /// done at once; from 256 up none are needed and a read of no bits
+    /// changes nothing.
+    #[inline(always)]
     fn renorm(&mut self) -> Result<(), CabacError> {
-        // The loop of §9.3.4.3.3 doubles ivlCurrRange (shifting one bit
-        // into ivlOffset) until it reaches 256: as many times as it
-        // has leading zeros past bit 8, done in one shift.
-        if self.ivl_curr_range < 256 {
-            let shift = self.ivl_curr_range.leading_zeros() - 7;
-            let bits = self.reader.u(shift as u8)? as u16;
-            self.ivl_curr_range <<= shift;
-            self.ivl_offset = (self.ivl_offset << shift) | bits;
-        }
-        Ok(())
+        let shift = self.range.leading_zeros().saturating_sub(23);
+        self.range <<= shift;
+        self.read_into_offset(shift)
     }
 
     /// §9.3.4.3.2 — DecodeDecision: decode one regular context-coded
     /// bin against the supplied context variable `ctx`, mutating it
     /// per the §9.3.4.3.2.2 state-transition process. Returns the
     /// decoded bin value (0 or 1).
+    #[inline]
     pub fn decode_decision(&mut self, ctx: &mut ContextModel) -> Result<u8, CabacError> {
-        // Step 1 (equations 9-64, 9-65): the LPS sub-range.
-        let q_range_idx = ((self.ivl_curr_range >> 6) & 3) as usize;
-        let ivl_lps_range = RANGE_TAB_LPS[ctx.p_state_idx as usize][q_range_idx] as u16;
-
-        // Step 2: subtract the LPS range; compare ivlOffset.
-        self.ivl_curr_range -= ivl_lps_range;
-        let bin_val;
-        if self.ivl_offset >= self.ivl_curr_range {
-            // LPS path.
-            bin_val = 1 - ctx.val_mps;
-            self.ivl_offset -= self.ivl_curr_range;
-            self.ivl_curr_range = ivl_lps_range;
-        } else {
-            // MPS path.
-            bin_val = ctx.val_mps;
-        }
-
-        // §9.3.4.3.2.2 state transition (equation 9-66).
-        if bin_val == ctx.val_mps {
-            ctx.p_state_idx = TRANS_IDX_MPS[ctx.p_state_idx as usize];
-        } else {
-            if ctx.p_state_idx == 0 {
-                ctx.val_mps = 1 - ctx.val_mps;
-            }
-            ctx.p_state_idx = TRANS_IDX_LPS[ctx.p_state_idx as usize];
-        }
-
-        // §9.3.4.3.3 renormalization.
+        // Equations 9-64 and 9-65, choosing between the LPS and MPS paths
+        // without a branch: which one a bin takes is close to
+        // unpredictable. Context states stay within 0..=62, so the mask
+        // only spares the table its bounds check.
+        let state = usize::from(ctx.p_state_idx & 63);
+        let q_range_idx = ((self.range >> 6) & 3) as usize;
+        let lps_range = u32::from(RANGE_TAB_LPS[state][q_range_idx]);
+        let mps_range = self.range - lps_range;
+        let scaled_mps = u64::from(mps_range) << self.ahead;
+        let lps = self.window >= scaled_mps;
+        // LPS: ivlOffset -= ivlCurrRange (the MPS share), ivlCurrRange =
+        // ivlLpsRange.
+        self.window -= scaled_mps & u64::from(lps).wrapping_neg();
+        self.range = if lps { lps_range } else { mps_range };
+        let bin_val = ctx.val_mps ^ u8::from(lps);
+        // §9.3.4.3.2.2 equation 9-66: an LPS in state 0 swaps valMps.
+        ctx.val_mps ^= u8::from(lps & (state == 0));
+        ctx.p_state_idx = TRANS_IDX[usize::from(lps)][state];
         self.renorm()?;
         Ok(bin_val)
     }
 
     /// §9.3.4.3.4 — DecodeBypass: decode one equal-probability bin.
     /// Doubles `ivlOffset` (shifting in one fresh bit), then compares
-    /// against `ivlCurrRange`. Returns the decoded bin (0 or 1).
+    /// against `ivlCurrRange`.
+    #[inline]
     pub fn decode_bypass(&mut self) -> Result<u8, CabacError> {
-        let bit = self.reader.u1()? as u16;
-        self.ivl_offset = (self.ivl_offset << 1) | bit;
-        if self.ivl_offset >= self.ivl_curr_range {
-            self.ivl_offset -= self.ivl_curr_range;
+        self.read_into_offset(1)?;
+        let scaled_range = self.scaled_range();
+        if self.window >= scaled_range {
+            self.window -= scaled_range;
             Ok(1)
         } else {
             Ok(0)
@@ -495,8 +577,8 @@ impl<'a> CabacEngine<'a> {
     /// is 1 (no renormalization, decoding is terminated), otherwise the
     /// result is 0 and renormalization is applied.
     pub fn decode_terminate(&mut self) -> Result<u8, CabacError> {
-        self.ivl_curr_range -= 2;
-        if self.ivl_offset >= self.ivl_curr_range {
+        self.range -= 2;
+        if self.window >= self.scaled_range() {
             Ok(1)
         } else {
             self.renorm()?;
@@ -506,10 +588,10 @@ impl<'a> CabacEngine<'a> {
 
     /// §9.3.4.3.6 — alignment process prior to aligned bypass decoding
     /// (applied before `coeff_abs_level_remaining[ ]` and
-    /// `coeff_sign_flag[ ]`): `ivlCurrRange = 256`. The bit reader and
-    /// `ivlOffset` are left untouched.
+    /// `coeff_sign_flag[ ]`): `ivlCurrRange = 256`. The bit position
+    /// and `ivlOffset` are left untouched.
     pub fn align(&mut self) {
-        self.ivl_curr_range = 256;
+        self.range = 256;
     }
 }
 
@@ -885,5 +967,363 @@ mod tests {
     fn cabac_error_stays_small() {
         assert!(core::mem::size_of::<CabacError>() <= 4);
         assert!(core::mem::size_of::<Result<u8, CabacError>>() <= 8);
+    }
+
+    /// The §9.3.4.3 engine as this crate first wrote it, reading a bit at a
+    /// time through a `BitReader`: the reference the windowed engine must
+    /// match.
+    ///
+    /// The engine holds the two §9.3.2.6 registers `ivlCurrRange` and
+    /// `ivlOffset` and the [`BitReader`] from which renormalization /
+    /// bypass pull `read_bits(1)`. Context variables ([`ContextModel`])
+    /// live in the caller's context-model array; each
+    /// [`decode_decision`](SpecEngine::decode_decision) call takes and
+    /// mutates one in place.
+    #[derive(Debug)]
+    pub struct SpecEngine<'a> {
+        reader: BitReader<'a>,
+        /// §9.3.2.6 `ivlCurrRange` (held in a 16-bit-wide register; values
+        /// stay within 9 bits during decode).
+        ivl_curr_range: u16,
+        /// §9.3.2.6 `ivlOffset` (10-bit register precision is required for
+        /// bypass).
+        ivl_offset: u16,
+    }
+
+    impl<'a> SpecEngine<'a> {
+        /// §9.3.2.6 — construct and initialize the arithmetic decoding
+        /// engine over `reader`, which the caller has positioned at the
+        /// first bit of `slice_segment_data()`. Sets `ivlCurrRange = 510`
+        /// and `ivlOffset = read_bits(9)`, and validates the §9.3.2.6
+        /// constraint that `ivlOffset` is not 510 or 511.
+        pub fn new(mut reader: BitReader<'a>) -> Result<Self, CabacError> {
+            let ivl_offset = reader.u(9)? as u16;
+            if ivl_offset >= 510 {
+                return Err(CabacError::InvalidInitOffset(ivl_offset));
+            }
+            Ok(Self {
+                reader,
+                ivl_curr_range: 510,
+                ivl_offset,
+            })
+        }
+
+        /// §9.3.2.6 — re-initialize the engine registers on an already
+        /// constructed engine (e.g. after `pcm_flag == 1` data is consumed,
+        /// per §9.3.2.5 / §9.3.2.6). The bit reader is *not* repositioned;
+        /// the caller is responsible for having advanced it to the byte
+        /// boundary following the PCM samples before calling this.
+        pub fn init_engine(&mut self) -> Result<(), CabacError> {
+            let ivl_offset = self.reader.u(9)? as u16;
+            if ivl_offset >= 510 {
+                return Err(CabacError::InvalidInitOffset(ivl_offset));
+            }
+            self.ivl_curr_range = 510;
+            self.ivl_offset = ivl_offset;
+            Ok(())
+        }
+
+        /// Current `ivlCurrRange` register value (for tests / inspection).
+        #[must_use]
+        pub fn ivl_curr_range(&self) -> u16 {
+            self.ivl_curr_range
+        }
+
+        /// §9.3.4.3.6 — alignment process prior to aligned bypass
+        /// decoding: `ivlCurrRange` is set equal to 256. Invoked when
+        /// `cabac_bypass_alignment_enabled_flag == 1` before the bypass
+        /// decoding of `coeff_sign_flag[ ]` / `coeff_abs_level_remaining[
+        /// ]` (and the §7.3.8.13 palette escape group) when
+        /// `escapeDataPresent == 1`. After alignment every bypass bin
+        /// consumes exactly one stream bit (the NOTE's shift-register
+        /// view); bypass decoding itself never changes `ivlCurrRange`, so
+        /// repeated invocations inside one aligned run are no-ops.
+        pub fn align_bypass(&mut self) {
+            self.ivl_curr_range = 256;
+        }
+
+        /// Current `ivlOffset` register value (for tests / inspection).
+        #[must_use]
+        pub fn ivl_offset(&self) -> u16 {
+            self.ivl_offset
+        }
+
+        /// Bit position of the underlying reader (for tests / locating the
+        /// engine's consumption point in the buffer).
+        #[must_use]
+        pub fn bit_pos(&self) -> usize {
+            self.reader.bit_pos()
+        }
+
+        /// §7.3.8.7 support — consume `pcm_alignment_zero_bit` from the
+        /// raw bit source until it is byte-aligned. Called right after a
+        /// `pcm_flag == 1` terminate bin: §9.3.4.3.5 leaves the bitstream
+        /// pointer directly after the terminating one bit, so the raw
+        /// reader position is authoritative for `byte_aligned()`.
+        ///
+        /// # Errors
+        /// [`CabacError::EndOfBuffer`] on a truncated stream.
+        pub fn pcm_align(&mut self) -> Result<(), CabacError> {
+            while !self.reader.bit_pos().is_multiple_of(8) {
+                let _ = self.reader.u1()?;
+            }
+            Ok(())
+        }
+
+        /// §7.3.8.7 support — read one raw `u(n)` field (a
+        /// `pcm_sample_luma` / `pcm_sample_chroma` value) directly from the
+        /// bit source, bypassing the arithmetic engine.
+        ///
+        /// # Errors
+        /// [`CabacError::EndOfBuffer`] on a truncated stream.
+        pub fn read_raw_bits(&mut self, n: u8) -> Result<u32, CabacError> {
+            Ok(self.reader.u(n)?)
+        }
+
+        /// Consume the engine and hand back its bit source (tests / callers
+        /// that continue non-CABAC parsing after termination).
+        #[must_use]
+        pub fn into_reader(self) -> BitReader<'a> {
+            self.reader
+        }
+
+        /// §9.3.4.3.3 — renormalization in the arithmetic decoding engine
+        /// (RenormD). While `ivlCurrRange < 256`, double `ivlCurrRange` and
+        /// shift one fresh bit into `ivlOffset`.
+        fn renorm(&mut self) -> Result<(), CabacError> {
+            // The loop of §9.3.4.3.3 doubles ivlCurrRange (shifting one bit
+            // into ivlOffset) until it reaches 256: as many times as it
+            // has leading zeros past bit 8, done in one shift.
+            if self.ivl_curr_range < 256 {
+                let shift = self.ivl_curr_range.leading_zeros() - 7;
+                let bits = self.reader.u(shift as u8)? as u16;
+                self.ivl_curr_range <<= shift;
+                self.ivl_offset = (self.ivl_offset << shift) | bits;
+            }
+            Ok(())
+        }
+
+        /// §9.3.4.3.2 — DecodeDecision: decode one regular context-coded
+        /// bin against the supplied context variable `ctx`, mutating it
+        /// per the §9.3.4.3.2.2 state-transition process. Returns the
+        /// decoded bin value (0 or 1).
+        pub fn decode_decision(&mut self, ctx: &mut ContextModel) -> Result<u8, CabacError> {
+            // Step 1 (equations 9-64, 9-65): the LPS sub-range.
+            let q_range_idx = ((self.ivl_curr_range >> 6) & 3) as usize;
+            let ivl_lps_range = RANGE_TAB_LPS[ctx.p_state_idx as usize][q_range_idx] as u16;
+
+            // Step 2: subtract the LPS range; compare ivlOffset.
+            self.ivl_curr_range -= ivl_lps_range;
+            let bin_val;
+            if self.ivl_offset >= self.ivl_curr_range {
+                // LPS path.
+                bin_val = 1 - ctx.val_mps;
+                self.ivl_offset -= self.ivl_curr_range;
+                self.ivl_curr_range = ivl_lps_range;
+            } else {
+                // MPS path.
+                bin_val = ctx.val_mps;
+            }
+
+            // §9.3.4.3.2.2 state transition (equation 9-66).
+            if bin_val == ctx.val_mps {
+                ctx.p_state_idx = TRANS_IDX_MPS[ctx.p_state_idx as usize];
+            } else {
+                if ctx.p_state_idx == 0 {
+                    ctx.val_mps = 1 - ctx.val_mps;
+                }
+                ctx.p_state_idx = TRANS_IDX_LPS[ctx.p_state_idx as usize];
+            }
+
+            // §9.3.4.3.3 renormalization.
+            self.renorm()?;
+            Ok(bin_val)
+        }
+
+        /// §9.3.4.3.4 — DecodeBypass: decode one equal-probability bin.
+        /// Doubles `ivlOffset` (shifting in one fresh bit), then compares
+        /// against `ivlCurrRange`. Returns the decoded bin (0 or 1).
+        pub fn decode_bypass(&mut self) -> Result<u8, CabacError> {
+            let bit = self.reader.u1()? as u16;
+            self.ivl_offset = (self.ivl_offset << 1) | bit;
+            if self.ivl_offset >= self.ivl_curr_range {
+                self.ivl_offset -= self.ivl_curr_range;
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        }
+
+        /// §9.3.4.3.4 — convenience wrapper: decode `n` bypass bins
+        /// MSB-first and accumulate them into an integer (`n` in 0..=32).
+        /// This is the common pattern for fixed-length bypass-coded fields.
+        /// `n == 0` returns 0 and consumes nothing.
+        pub fn decode_bypass_bits(&mut self, n: u8) -> Result<u32, CabacError> {
+            let mut value: u32 = 0;
+            for _ in 0..n {
+                value = (value << 1) | (self.decode_bypass()? as u32);
+            }
+            Ok(value)
+        }
+
+        /// §9.3.4.3.5 — DecodeTerminate: the decision before termination
+        /// (`end_of_slice_segment_flag`, `end_of_subset_one_bit`,
+        /// `pcm_flag`; `ctxTable == 0`, `ctxIdx == 0`). Decrements
+        /// `ivlCurrRange` by 2; if `ivlOffset >= ivlCurrRange` the result
+        /// is 1 (no renormalization, decoding is terminated), otherwise the
+        /// result is 0 and renormalization is applied.
+        pub fn decode_terminate(&mut self) -> Result<u8, CabacError> {
+            self.ivl_curr_range -= 2;
+            if self.ivl_offset >= self.ivl_curr_range {
+                Ok(1)
+            } else {
+                self.renorm()?;
+                Ok(0)
+            }
+        }
+
+        /// §9.3.4.3.6 — alignment process prior to aligned bypass decoding
+        /// (applied before `coeff_abs_level_remaining[ ]` and
+        /// `coeff_sign_flag[ ]`): `ivlCurrRange = 256`. The bit reader and
+        /// `ivlOffset` are left untouched.
+        pub fn align(&mut self) {
+            self.ivl_curr_range = 256;
+        }
+    }
+
+    /// The windowed engine against §9.3.4.3 read literally, a bit at a
+    /// time through a `BitReader` (`SpecEngine`, the engine this crate
+    /// used before): random streams, read from any starting bit, through
+    /// random runs of decisions, bypass bins, terminations, alignments
+    /// and the PCM path's raw reads and re-initialization, compared
+    /// result for result, register for register and bit position for
+    /// bit position until the stream runs out.
+    #[test]
+    fn windowed_engine_matches_the_spec_engine() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        };
+        let mut ops = [0usize; 8];
+        for case in 0..20000 {
+            let len = 1 + (next() % 64) as usize;
+            let data: Vec<u8> = match case % 8 {
+                // Runs of zeros and ones keep a context in its MPS and walk
+                // it to the extreme states, where renormalization shifts
+                // the most at once.
+                0 => vec![0x00; len],
+                1 => vec![0xFF; len],
+                2 => (0..len).map(|_| (next() % 2) as u8 * 0xFF).collect(),
+                _ => (0..len).map(|_| next() as u8).collect(),
+            };
+            let start = (next() % (len as u64 * 8 + 1)) as usize;
+            let mut reader = BitReader::new(&data);
+            reader.skip(start).unwrap();
+            let (windowed, spec) = (CabacEngine::new(reader.clone()), SpecEngine::new(reader));
+            let (mut w, mut s) = match (windowed, spec) {
+                (Ok(w), Ok(s)) => (w, s),
+                (w, s) => {
+                    assert_eq!(w.err(), s.err(), "case {case}: initialization");
+                    continue;
+                }
+            };
+            let mut contexts: Vec<ContextModel> = (0..4)
+                .map(|_| ContextModel {
+                    p_state_idx: (next() % 63) as u8,
+                    val_mps: (next() % 2) as u8,
+                })
+                .collect();
+            for step in 0..400 {
+                let pick = next() % 100;
+                let at = format!("case {case}, step {step}");
+                let result = if pick < 55 {
+                    ops[0] += 1;
+                    let i = (next() % 4) as usize;
+                    let mut spec_ctx = contexts[i];
+                    let r = (
+                        w.decode_decision(&mut contexts[i]),
+                        s.decode_decision(&mut spec_ctx),
+                    );
+                    assert_eq!(contexts[i], spec_ctx, "{at}: context after a decision");
+                    (r.0.map(u32::from), r.1.map(u32::from))
+                } else if pick < 75 {
+                    ops[1] += 1;
+                    (
+                        w.decode_bypass().map(u32::from),
+                        s.decode_bypass().map(u32::from),
+                    )
+                } else if pick < 85 {
+                    ops[2] += 1;
+                    let n = (next() % 33) as u8;
+                    (w.decode_bypass_bits(n), s.decode_bypass_bits(n))
+                } else if pick < 92 {
+                    // Alignment keeps a conforming engine's ivlOffset below
+                    // ivlCurrRange; a stream needs it only there.
+                    if s.ivl_offset() >= 256 {
+                        continue;
+                    }
+                    ops[3] += 1;
+                    if pick % 2 == 0 {
+                        w.align();
+                        s.align();
+                    } else {
+                        w.align_bypass();
+                        s.align_bypass();
+                    }
+                    (Ok(0), Ok(0))
+                } else {
+                    ops[4] += 1;
+                    let r = (w.decode_terminate(), s.decode_terminate());
+                    if r == (Ok(1), Ok(1)) {
+                        // Terminated: the PCM path (alignment, raw samples,
+                        // re-initialization) or the end of the slice.
+                        ops[5] += 1;
+                        assert_eq!(w.pcm_align(), s.pcm_align(), "{at}: PCM alignment");
+                        for _ in 0..(next() % 4) {
+                            let n = (next() % 34) as u8;
+                            assert_eq!(
+                                w.read_raw_bits(n),
+                                s.read_raw_bits(n),
+                                "{at}: raw {n} bits"
+                            );
+                        }
+                        assert_eq!(w.bit_pos(), s.bit_pos(), "{at}: position after PCM samples");
+                        if next() % 4 == 0 {
+                            ops[6] += 1;
+                            let (wr, sr) = (w.into_reader(), s.into_reader());
+                            assert_eq!(
+                                (wr.bit_pos(), wr.bits_left()),
+                                (sr.bit_pos(), sr.bits_left()),
+                                "{at}: reader handed back"
+                            );
+                            break;
+                        }
+                        let init = (w.init_engine(), s.init_engine());
+                        assert_eq!(init.0, init.1, "{at}: re-initialization");
+                        if init.0.is_err() {
+                            break;
+                        }
+                        ops[7] += 1;
+                    }
+                    (r.0.map(u32::from), r.1.map(u32::from))
+                };
+                assert_eq!(result.0, result.1, "{at}: result");
+                if result.0.is_err() {
+                    break;
+                }
+                assert_eq!(
+                    (w.ivl_curr_range(), w.ivl_offset(), w.bit_pos()),
+                    (s.ivl_curr_range(), s.ivl_offset(), s.bit_pos()),
+                    "{at}: registers and position"
+                );
+            }
+        }
+        assert!(
+            ops.iter().all(|&n| n > 50),
+            "every operation exercised many times: {ops:?}"
+        );
     }
 }
