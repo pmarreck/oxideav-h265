@@ -43,3 +43,10 @@ bench = false
 # instrumentation flags the surrounding crates never want).
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "hvcc_decode_threaded"
+path = "fuzz_targets/hvcc_decode_threaded.rs"
+test = false
+doc = false
+bench = false
