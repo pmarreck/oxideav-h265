@@ -356,26 +356,40 @@ fn video_frame_owned(pic: Picture, pts: Option<i64>) -> VideoFrame {
         pic.plane_dims(Plane::Cb),
         pic.plane_dims(Plane::Cr),
     ];
-    let (y, cb, cr) = pic.into_planes();
-    let sources = if chroma {
-        vec![(y, dims[0]), (cb, dims[1]), (cr, dims[2])]
+    // The planes are read in place: a picture still held as a reference
+    // shares them, and taking them out would copy each one first.
+    let planes: &[(Plane, (usize, usize))] = if chroma {
+        &[
+            (Plane::Luma, dims[0]),
+            (Plane::Cb, dims[1]),
+            (Plane::Cr, dims[2]),
+        ]
     } else {
-        vec![(y, dims[0])]
+        &[(Plane::Luma, dims[0])]
     };
-    let mut out = Vec::with_capacity(sources.len());
-    for (buf, (w, h)) in sources {
-        let n = w * h;
-        let (stride, data) = if wide {
-            let mut data = Vec::with_capacity(n * 2);
-            for &v in buf.iter().take(n) {
-                data.extend_from_slice(&v.to_le_bytes());
+    let out = planes
+        .iter()
+        .map(|&(plane, (w, h))| {
+            let all = pic.plane(plane);
+            let samples = &all[..(w * h).min(all.len())];
+            if wide {
+                // Little-endian 16-bit samples, written in a form that
+                // compiles to a straight vectorized copy.
+                let mut data = vec![0u8; samples.len() * 2];
+                for (bytes, &v) in data.chunks_exact_mut(2).zip(samples) {
+                    bytes.copy_from_slice(&v.to_le_bytes());
+                }
+                VideoPlane {
+                    stride: w * 2,
+                    data,
+                }
+            } else {
+                VideoPlane {
+                    stride: w,
+                    data: samples.iter().map(|&v| v as u8).collect(),
+                }
             }
-            (w * 2, data)
-        } else {
-            (w, buf.iter().take(n).map(|&v| v as u8).collect())
-        };
-        drop(buf);
-        out.push(VideoPlane { stride, data });
-    }
+        })
+        .collect();
     VideoFrame { pts, planes: out }
 }
