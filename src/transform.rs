@@ -201,6 +201,37 @@ pub fn scale_coefficients(
     extended_precision: bool,
     scaling: Option<&ScalingFactorMatrix>,
 ) -> Result<Vec<i32>, TransformError> {
+    scale_coefficients_with_extent(levels, n_tbs, q_p, bit_depth, extended_precision, scaling)
+        .map(|(d, _)| d)
+}
+
+/// Where a block's non-zero values lie: the largest column holding one
+/// and the last row holding one, or `None` when every value is zero.
+/// The transform runs over that corner only (see [`inverse_transform`]).
+type Extent = Option<(usize, usize)>;
+
+/// The extent of the non-zero values of `d`, a block `n_tbs` wide.
+fn nonzero_extent(d: &[i32], n_tbs: usize) -> Extent {
+    let mut extent = None;
+    for (y, row) in d.chunks(n_tbs.max(1)).enumerate() {
+        if let Some(last) = row.iter().rposition(|&v| v != 0) {
+            let max_x = extent.map_or(0, |(x, _)| x);
+            extent = Some((max_x.max(last), y));
+        }
+    }
+    extent
+}
+
+/// [`scale_coefficients`], also reporting the extent of the scaled
+/// values it found while scaling, so the transform need not scan for it.
+fn scale_coefficients_with_extent(
+    levels: &[i32],
+    n_tbs: usize,
+    q_p: u32,
+    bit_depth: u8,
+    extended_precision: bool,
+    scaling: Option<&ScalingFactorMatrix>,
+) -> Result<(Vec<i32>, Extent), TransformError> {
     let log2_tbs = log2_tbs(n_tbs).ok_or(TransformError::InvalidBlockSize(n_tbs))?;
     if !(8..=16).contains(&bit_depth) {
         return Err(TransformError::InvalidBitDepth(bit_depth));
@@ -240,6 +271,7 @@ pub fn scale_coefficients(
     let round = 1i64 << (bd_shift - 1);
 
     let mut d = vec![0i32; count];
+    let mut extent: Extent = None;
     for y in 0..n_tbs {
         for x in 0..n_tbs {
             let idx = y * n_tbs + x;
@@ -261,9 +293,13 @@ pub fn scale_coefficients(
             let shifted = (prod << qp_div6) + round;
             let scaled = clip3(coeff_min as i64, coeff_max as i64, shifted >> bd_shift);
             d[idx] = scaled as i32;
+            // Rows run in order, so the last one seen is the last row.
+            if scaled != 0 {
+                extent = Some((extent.map_or(x, |(max_x, _)| max_x.max(x)), y));
+            }
         }
     }
-    Ok(d)
+    Ok((d, extent))
 }
 
 /// §8.6.4.2 equation 8-316 — the `trType == 1` 4x4 alternate (DST-VII)
@@ -439,6 +475,29 @@ pub fn inverse_transform(
     bit_depth: u8,
     extended_precision: bool,
 ) -> Result<Vec<i32>, TransformError> {
+    let extent = nonzero_extent(d, n_tbs);
+    inverse_transform_within(
+        d,
+        n_tbs,
+        pred_mode,
+        component,
+        bit_depth,
+        extended_precision,
+        extent,
+    )
+}
+
+/// [`inverse_transform`] over `extent`, which holds every non-zero
+/// value of `d` (as [`nonzero_extent`] finds it).
+fn inverse_transform_within(
+    d: &[i32],
+    n_tbs: usize,
+    pred_mode: PredMode,
+    component: Component,
+    bit_depth: u8,
+    extended_precision: bool,
+    extent: Extent,
+) -> Result<Vec<i32>, TransformError> {
     if log2_tbs(n_tbs).is_none() {
         return Err(TransformError::InvalidBlockSize(n_tbs));
     }
@@ -465,21 +524,10 @@ pub fn inverse_transform(
     // non-zero column are all zero. Zero inputs contribute nothing to
     // either matrix product, so the passes run over the non-zero extent
     // only (an all-zero block synthesizes to all zeros).
-    let mut max_x = 0usize;
-    let mut max_y = 0usize;
-    let mut any = false;
-    for y in 0..n_tbs {
-        let row = &d[y * n_tbs..(y + 1) * n_tbs];
-        if let Some(last) = row.iter().rposition(|&v| v != 0) {
-            any = true;
-            max_x = max_x.max(last);
-            max_y = y;
-        }
-    }
     let mut r = vec![0i32; count];
-    if !any {
+    let Some((max_x, max_y)) = extent else {
         return Ok(r);
-    }
+    };
     if extended_precision {
         inverse_transform_passes::<i64>(
             d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, &mut r,
@@ -854,7 +902,7 @@ pub fn residual_block(
     }
 
     // §8.6.2 ordered step 1: §8.6.3 scaling process -> d.
-    let d = scale_coefficients(
+    let (d, extent) = scale_coefficients_with_extent(
         levels,
         n_tbs,
         params.q_p,
@@ -886,14 +934,15 @@ pub fn residual_block(
         }
         r
     } else {
-        // §8.6.4 transformation process.
-        inverse_transform(
+        // §8.6.4 transformation process, over the extent the scaling found.
+        inverse_transform_within(
             &d,
             n_tbs,
             params.pred_mode,
             params.component,
             params.bit_depth,
             params.extended_precision,
+            extent,
         )?
     };
 
@@ -1022,6 +1071,55 @@ pub fn act_inverse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extent the scaling reports is the one a scan of its output
+    /// finds, including levels that scale to zero (a high bit depth, a
+    /// large block and a low qP round small levels away).
+    #[test]
+    fn the_extent_found_while_scaling_matches_a_scan_of_the_result() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        };
+        let mut zeroed = 0;
+        for n in [4usize, 8, 16, 32] {
+            for bit_depth in [8u8, 10, 16] {
+                for _ in 0..if cfg!(miri) { 2 } else { 200 } {
+                    let q_p = (next() % 52) as u32;
+                    let mut levels = vec![0i32; n * n];
+                    for level in levels.iter_mut() {
+                        *level = match next() % 6 {
+                            0 => (next() % 64) as i32 - 32,
+                            1 => 1,
+                            2 => -1,
+                            _ => 0,
+                        };
+                    }
+                    let (d, extent) =
+                        scale_coefficients_with_extent(&levels, n, q_p, bit_depth, false, None)
+                            .unwrap();
+                    assert_eq!(
+                        extent,
+                        nonzero_extent(&d, n),
+                        "n {n} depth {bit_depth} qP {q_p}"
+                    );
+                    assert_eq!(
+                        d,
+                        scale_coefficients(&levels, n, q_p, bit_depth, false, None).unwrap()
+                    );
+                    zeroed += levels
+                        .iter()
+                        .zip(&d)
+                        .filter(|(l, v)| **l != 0 && **v == 0)
+                        .count();
+                }
+            }
+        }
+        assert!(zeroed > 0, "some levels scale to zero");
+    }
 
     /// The row-at-a-time DCT-II gives exactly the per-vector passes' result
     /// for every block size, sparse extents from one coefficient to the whole
