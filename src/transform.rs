@@ -484,12 +484,125 @@ pub fn inverse_transform(
         inverse_transform_passes::<i64>(
             d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, &mut r,
         );
-    } else {
+    } else if tr_type {
         inverse_transform_passes::<i32>(
             d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, &mut r,
         );
+    } else {
+        inverse_dct_rows(d, n_tbs, (coeff_min, coeff_max), (max_x, max_y), &mut r);
     }
     Ok(r)
+}
+
+thread_local! {
+    /// Per-thread working rows of [`inverse_dct_rows`]: the column pass's
+    /// output, the clipped and transposed intermediate, the row pass's output
+    /// and the even halves of the recursion, 32 × 32 values each at most.
+    static IDCT_SCRATCH: core::cell::RefCell<Vec<i32>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`inverse_transform_passes`] for the DCT-II at 32 bits, a row at a time:
+/// each pass computes every output row as a sum of input rows times basis
+/// values, `y[ i ] = Σ_j transMatrix[ i ][ j · stride ] · x[ j ]`, over all of
+/// a row's columns at once, which the compiler vectorizes across the columns;
+/// the row pass runs the same on the transposed intermediate. The same even /
+/// odd regrouping and the same skipped zero rows and columns as
+/// [`idct_even_odd`], so the same integer sums in another order: the result
+/// is the matrix product bit for bit.
+fn inverse_dct_rows(
+    d: &[i32],
+    n: usize,
+    (coeff_min, coeff_max): (i32, i32),
+    (max_x, max_y): (usize, usize),
+    r: &mut [i32],
+) {
+    let (w, rows) = (max_x + 1, max_y + 1);
+    IDCT_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < 4 * 32 * 32 {
+            scratch.resize(4 * 32 * 32, 0);
+        }
+        let (e, rest) = scratch.split_at_mut(n * w);
+        let (gt, rest) = rest.split_at_mut(n * n);
+        let (t, spare) = rest.split_at_mut(n * n);
+        // §8.6.4 step 1, the column transform: rows of `d` (row pitch `n`),
+        // the first `w` columns, of which only the first `rows` rows may be
+        // non-zero; `e` is `n` rows of `w`.
+        idct_rows((d, n), n, w, rows, (e, w), spare);
+        // Step 2 (eq. 8-314), the clip, into the transposed layout: row `c`
+        // of `gt` holds column `c`. Columns past `w` are zero after the column
+        // pass, so the row pass reads only its first `w` rows.
+        for (i, row) in e.chunks_exact(w).enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                gt[c * n + i] = ((v + 64) >> 7).clamp(coeff_min, coeff_max);
+            }
+        }
+        // Step 3, the row transform, as a column transform of the transpose.
+        idct_rows((gt, n), n, n, w, (t, n), spare);
+        for (x, row) in t.chunks_exact(n).enumerate() {
+            for (i, &v) in row.iter().enumerate() {
+                r[i * n + x] = v;
+            }
+        }
+    });
+}
+
+/// The `n`-point DCT-II synthesis of [`idct_even_odd`], with every value a
+/// row of `w` values: input row `j` at `x.0[ j · x.1 .. ]` (only the first
+/// `nz` rows are read, the rest being zero), output row `i` at `y.0[ i · y.1
+/// .. ]`. The even half reads every other input row in place, at twice the
+/// pitch; `spare` holds its output rows.
+fn idct_rows(
+    (x, xp): (&[i32], usize),
+    n: usize,
+    w: usize,
+    nz: usize,
+    (y, yp): (&mut [i32], usize),
+    spare: &mut [i32],
+) {
+    let stride = 32 / n;
+    let row = |j: usize| &x[j * xp..j * xp + w];
+    if n == 4 {
+        let b = |j: usize, i: usize| DCT32[j * stride][i];
+        let zero = [0i32; 32];
+        let get = |j: usize| if j < nz { row(j) } else { &zero[..w] };
+        let (x0, x1, x2, x3) = (get(0), get(1), get(2), get(3));
+        for c in 0..w {
+            let e0 = b(0, 0) * x0[c] + b(2, 0) * x2[c];
+            let e1 = b(0, 1) * x0[c] + b(2, 1) * x2[c];
+            let o0 = b(1, 0) * x1[c] + b(3, 0) * x3[c];
+            let o1 = b(1, 1) * x1[c] + b(3, 1) * x3[c];
+            y[c] = e0 + o0;
+            y[yp + c] = e1 + o1;
+            y[2 * yp + c] = e1 - o1;
+            y[3 * yp + c] = e0 - o0;
+        }
+        return;
+    }
+    let half = n / 2;
+    let (even, spare) = spare.split_at_mut(half * w);
+    idct_rows((x, 2 * xp), half, w, nz.div_ceil(2), (even, w), spare);
+    let mut o = [0i32; 32];
+    let o = &mut o[..w];
+    for i in 0..half {
+        o.fill(0);
+        for m in 0..nz / 2 {
+            let k = DCT32[(2 * m + 1) * stride][i];
+            for (a, &v) in o.iter_mut().zip(row(2 * m + 1)) {
+                *a += k * v;
+            }
+        }
+        let e = &even[i * w..(i + 1) * w];
+        let (top, bottom) = y.split_at_mut((n - 1 - i) * yp);
+        for ((t, (&ev, &ov)), b) in top[i * yp..i * yp + w]
+            .iter_mut()
+            .zip(e.iter().zip(o.iter()))
+            .zip(bottom[..w].iter_mut())
+        {
+            *t = ev + ov;
+            *b = ev - ov;
+        }
+    }
 }
 
 /// The arithmetic type of the two §8.6.4 passes: `i32` holds every
@@ -909,6 +1022,47 @@ pub fn act_inverse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row-at-a-time DCT-II gives exactly the per-vector passes' result
+    /// for every block size, sparse extents from one coefficient to the whole
+    /// block, and coefficients across the 16-bit range the clip allows.
+    #[test]
+    fn the_row_at_a_time_inverse_dct_matches_the_per_vector_one() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let (lo, hi) = coeff_range(10, false);
+        for n in [4usize, 8, 16, 32] {
+            for round in 0..if cfg!(miri) { 4 } else { 300 } {
+                let (max_x, max_y) = ((next() % n as u64) as usize, (next() % n as u64) as usize);
+                let mut d = vec![0i32; n * n];
+                for y in 0..=max_y {
+                    for x in 0..=max_x {
+                        // Mostly small, sometimes at the ends of the range, some zeros.
+                        d[y * n + x] = match next() % 8 {
+                            0 => 0,
+                            1 => lo,
+                            2 => hi,
+                            _ => (next() % 512) as i32 - 256,
+                        };
+                    }
+                }
+                // The extents the caller finds: the last non-zero row and column.
+                d[max_y * n + max_x] = if round % 2 == 0 { 1 } else { hi };
+                let (mut want, mut got) = (vec![0i32; n * n], vec![0i32; n * n]);
+                inverse_transform_passes::<i32>(&d, n, false, lo, hi, max_x, max_y, &mut want);
+                inverse_dct_rows(&d, n, (lo, hi), (max_x, max_y), &mut got);
+                assert_eq!(
+                    got, want,
+                    "{n}x{n}, extent ({max_x}, {max_y}), round {round}"
+                );
+            }
+        }
+    }
 
     fn flat_levels(n: usize, fill: &[(usize, usize, i32)]) -> Vec<i32> {
         let mut v = vec![0i32; n * n];
