@@ -503,6 +503,9 @@ pub enum ResidualCodingError {
     UnsupportedScanIdx(ScanIdx),
     /// A §7.3.8.13 `palette_coding( )` element violated a parse bound.
     Palette(crate::palette::PaletteError),
+    /// The last significant position falls outside the block, which
+    /// the §9.3.4.2.3 binarization bounds rule out.
+    LastPositionOutsideBlock { x: u32, y: u32, log2: u32 },
 }
 
 impl From<crate::palette::PaletteError> for ResidualCodingError {
@@ -520,6 +523,11 @@ impl core::fmt::Display for ResidualCodingError {
                 write!(f, "residual_coding: log2TrafoSize {v} outside 2..=5")
             }
             Self::Palette(e) => write!(f, "{e}"),
+            Self::LastPositionOutsideBlock { x, y, log2 } => write!(
+                f,
+                "residual_coding: last significant position ({x}, {y}) outside a {0}x{0} block",
+                1u32 << log2
+            ),
             Self::UnsupportedScanIdx(s) => {
                 write!(
                     f,
@@ -623,6 +631,24 @@ fn read_last_sig_suffix<B: ResidualBinSource>(
     Ok(last_sig_coeff_position(prefix, suffix))
 }
 
+/// Where `(x, y)` falls in a block's scans: its sub-block's index in
+/// `sub_scan` and its index in the in-sub-block `pos_scan`; `None` when
+/// it is outside the block.
+fn last_scan_place(
+    sub_scan: &[crate::scan::ScanPos],
+    pos_scan: &[crate::scan::ScanPos],
+    x: u32,
+    y: u32,
+) -> Option<(usize, usize)> {
+    let sub_block = sub_scan
+        .iter()
+        .position(|sb| u32::from(sb.x) == x >> 2 && u32::from(sb.y) == y >> 2)?;
+    let scan_pos = pos_scan
+        .iter()
+        .position(|p| u32::from(p.x) == x & 3 && u32::from(p.y) == y & 3)?;
+    Some((sub_block, scan_pos))
+}
+
 /// §7.3.8.11 — decode one `residual_coding( )` body (from
 /// `last_sig_coeff_x_prefix` onward; see the module docs for the
 /// exact scope) against a generic [`ResidualBinSource`].
@@ -666,26 +692,21 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
     let num_sb_1d = 1usize << (log2 - 2);
     let size = 1usize << log2;
 
-    // §7.3.8.11 do-while: locate (lastSubBlock, lastScanPos) from the
-    // last-significant position. The decoded position is always
-    // inside the TB (the §9.3.4.2.3 cMax bounds the prefix), so the
-    // walk terminates.
-    let mut last_scan_pos: i32 = 16;
-    let mut last_sub_block: i32 = (num_sb_1d * num_sb_1d) as i32 - 1;
-    loop {
-        if last_scan_pos == 0 {
-            last_scan_pos = 16;
-            last_sub_block -= 1;
-        }
-        last_scan_pos -= 1;
-        debug_assert!(last_sub_block >= 0, "last-sig position outside the TB");
-        let sb = sub_scan[last_sub_block as usize];
-        let xc = (u32::from(sb.x) << 2) + u32::from(pos_scan[last_scan_pos as usize].x);
-        let yc = (u32::from(sb.y) << 2) + u32::from(pos_scan[last_scan_pos as usize].y);
-        if xc == last_x && yc == last_y {
-            break;
-        }
-    }
+    // §7.3.8.11 do-while: (lastSubBlock, lastScanPos) are where the
+    // last-significant position falls in the sub-block scan and the
+    // scan inside its sub-block. The spec walks back from the block's
+    // end to find them (up to 1,023 steps in a 32x32 block); each scan
+    // is a permutation, so each is found directly. The decoded
+    // position is always inside the TB (the §9.3.4.2.3 cMax bounds the
+    // prefix); one outside is an error, not a panic.
+    let outside = || ResidualCodingError::LastPositionOutsideBlock {
+        x: last_x,
+        y: last_y,
+        log2,
+    };
+    let (last_sub_block, last_scan_pos) =
+        last_scan_place(&sub_scan, &pos_scan, last_x, last_y).ok_or_else(outside)?;
+    let (last_sub_block, last_scan_pos) = (last_sub_block as i32, last_scan_pos as i32);
 
     let mut levels = vec![0i32; size * size];
     // coded_sub_block_flag[ xS ][ yS ] grid, row-major by yS.
@@ -992,6 +1013,46 @@ pub fn decode_residual_coding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The direct lookup against §7.3.8.11's walk back from the block's
+    /// end, for every position of every block size and scan.
+    #[test]
+    fn the_last_position_lookup_matches_the_spec_walk() {
+        for log2 in 2..=5u32 {
+            for scan_idx in [ScanIdx::Diagonal, ScanIdx::Horizontal, ScanIdx::Vertical] {
+                let pos_scan = scan_order(2, scan_idx).unwrap();
+                let sub_scan = scan_order((log2 - 2) as u8, scan_idx).unwrap();
+                let size = 1u32 << log2;
+                for y in 0..size {
+                    for x in 0..size {
+                        let mut last_scan_pos = 16usize;
+                        let mut last_sub_block = sub_scan.len() - 1;
+                        loop {
+                            if last_scan_pos == 0 {
+                                last_scan_pos = 16;
+                                last_sub_block -= 1;
+                            }
+                            last_scan_pos -= 1;
+                            let sb = sub_scan[last_sub_block];
+                            let p = pos_scan[last_scan_pos];
+                            if (u32::from(sb.x) << 2) + u32::from(p.x) == x
+                                && (u32::from(sb.y) << 2) + u32::from(p.y) == y
+                            {
+                                break;
+                            }
+                        }
+                        assert_eq!(
+                            last_scan_place(&sub_scan, &pos_scan, x, y),
+                            Some((last_sub_block, last_scan_pos)),
+                            "log2 {log2} scan {scan_idx:?} at ({x},{y})"
+                        );
+                    }
+                }
+                assert_eq!(last_scan_place(&sub_scan, &pos_scan, size, 0), None);
+                assert_eq!(last_scan_place(&sub_scan, &pos_scan, 0, size), None);
+            }
+        }
+    }
     use crate::bitreader::BitReader;
     use std::collections::VecDeque;
 
